@@ -1,0 +1,3 @@
+[submodule "paris"]
+	path = paris
+	url = https://github.com/tbonald/paris
