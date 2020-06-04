@@ -1,16 +1,8 @@
 import spacy
-import networkx as nx
-import numpy as np
-from req_analysis.libs.metrics import fuzzy_match_score
-from req_analysis.libs.neptune_wrapper import node_distance
+from py2neo import Node, Relationship
 
-from paris import paris
-from paris.utils import select_clustering, select_clustering_gen
-
-import scipy
-import scipy.spatial.distance as ssd
-
-import time
+from req_analysis.lib.neo4j_wrapper import get_weighted_neighbors
+from req_analysis.lib.metrics import fuzzy_match_score
 
 nlp_np = spacy.load("en_core_web_sm")
 merge_nps = nlp_np.create_pipe("merge_noun_chunks")
@@ -21,179 +13,136 @@ nlp_np.add_pipe(merge_nps)
 class Requirement():
 
 
-    def __init__(self, uri, req_text):
-        self.text_uri = uri
-        self.text = req_text
-        self.tokens = []
+    def __init__(self, model, req_node):
+        self.model = model
+        self.node = req_node
+        self.name = req_node['name']
+        self.uuid = req_node['uuid']
+        self.text = req_node['req_text'] or ''
+        self.doc_np = nlp_np(self.text)
+        self.phrase_node = None
+        self.phrase_relation = None
+        self.token_nodes = []
+        self.token_relations = []
         self.transclusion_relations = []
-
-        for token in nlp_np(self.text):
-            self.tokens.append(dict(text=token.text, pos=token.pos_, token_id=token.i))
-
-        self.req_subgraph = None
+        self.transcluded_text = None
 
 
-    def match_req_tokens(self, model_elements, match_threshold, pos_list=["NOUN", "PROPN"]):
+    def init_req_nodes(self):
+        # TODO: Maybe include that in the __init__ ?
+        '''Initializes the phrase/token nodes and relations of the requirement'''
+        req_phrase_node = Node("ReqPhrase", req_text=self.text)
+        self.phrase_node = req_phrase_node
+        self.phrase_relation = (Relationship(self.node, "IS", req_phrase_node))
+
+        req_doc = nlp_np(self.text)
+
+        for token in req_doc:
+            token_node = Node("ReqChunk", chunk=token.text, pos=token.pos_)
+
+            self.token_nodes.append(token_node)
+            self.token_relations.append(Relationship(req_phrase_node, "IS_COMPOSED_OF", token_node))
+
+
+    def match_req_tokens(self, pos_list=["NOUN", "PROPN"], relationship_filter='PART|TYPED|ALLOCATED|_', label_filter='', min_level=1, max_level=8, weighted_depth_limit=8):
         '''Takes in a Requirement object and optional configuration
-        Returns a list of matches between the tokens in the requirement and the list of model_elements
-        Will match on the 'name' attribute of the model_elements dictionnaries'''
+        Returns a list of matches between the tokens in the requirement and the rest of the model
+        Will match on the 'name' attribute of the model elements'''
 
-        self.transclusion_relations.clear()
-        c=0
+        # This will return a dict with the neighbors of the req_node, ordered by weighted_depth 
+        # Might be optimizable by not calling .data() and iterating on the cursor.. not sure, not essential for now
+        neighbor_dict = get_weighted_neighbors(self.model.graph, self.node, weighted_depth_limit, relationship_filter, label_filter, min_level, max_level).data()
+
         # In all req tokens
-        for token in self.tokens:
+        for token_node in self.token_nodes:
             # Only POS of interest
-            if token['pos'] in pos_list:
+            if token_node['pos'] in pos_list:
 
                 found_match = None
+                # For an increasing weighted_depth
+                for neighbor in neighbor_dict:
 
-                for element in model_elements:
-                    c+=1
-                    fuzzy_score = fuzzy_match_score(token['text'],  element['name'])
+                    if found_match!=None:
+                        break
 
-                    if fuzzy_score < match_threshold:
+                    # Iterate through all n-degree neighbors
+                    for neighbor_node in neighbor['nodes_at_depth']:
 
-                        found_match = dict(token=token, model_element=element, score=fuzzy_score)
-                        self.transclusion_relations.append(found_match)
+                        # Nothing restricts neighbor_node to have a name but the way the graph was generated, so we may want to catch eceptions
+                        try:
+                            fuzzy_score = fuzzy_match_score(token_node['chunk'],  neighbor_node['name'])
+                        except:
+                            print('Unexpected Behavior: neighbor_node has no name attribute: ', neighbor_node)
+                            break
 
-        return self.transclusion_relations, c
+                        if fuzzy_score < self.model.match_threshold:
+
+                            if found_match == None:
+                                found_match = dict(token_node=token_node, neighbor_node=neighbor_node, score=fuzzy_score)
+                            elif fuzzy_score < found_match['score']:
+                                found_match = dict(token_node=token_node, neighbor_node=neighbor_node, score=fuzzy_score)
+
+                if found_match != None:
+                    self.transclusion_relations.append(found_match)
 
 
-    def init_match_subgraph(self, g):
-        '''Initializes a NetworkX subgraph that contains all the couple (token, model_element_match) found and their edges are
-        weighted on their distance in the model'''
-        number_matches = len(self.transclusion_relations)
-        req_subgraph = nx.Graph()
 
-        # We want one node per matched token and not per model element matched
-        # The more it is referenced, the more important it is (if the text says 'APS' 10 times, APS has to be important)
-        for i in range(number_matches):
-            req_subgraph.add_node(i, **self.transclusion_relations[i])
+    def init_transcluded_text(self):
+        '''Initializes the transcluded_text for a requirement that already has transcluded_relations'''
+        text_chunks = [node['chunk'] for node in self.token_nodes]
+        print()
+        for transclusion in self.transclusion_relations:
+            index = self.token_nodes.index(transclusion['token_node'])
+            transcluded_qualified_name = self.model.get_qualified_name(transclusion['neighbor_node'])
+            text_chunks[index] = "<cref id='" + transcluded_qualified_name + "'>" + text_chunks[index] + "</cref>"
+        self.transcluded_text = ' '.join(text_chunks)
 
-        for i in range(number_matches):
-            for j in range(i+1, number_matches):
-                el_i, el_j = self.transclusion_relations[i]['model_element'], self.transclusion_relations[j]['model_element']
 
-                if el_i == el_j:
-                    dist_ij = 0.1
-                    print(i, j)
-                    print('The 2 model elements are the same')
+
+    def context_cluster_scoring(self, context_cluster, pos_list=["NOUN", "PROPN"]):
+        '''Takes in a ContextCluster and returns the match score between the Requirement and the ContextCluster'''
+        context_score = 0
+
+        # In all req tokens
+        for token_node in self.token_nodes:
+            # Only POS of interest
+            if token_node['pos'] in pos_list:
+
+                # SOURCE NODE
+                fuzzy_score_source = fuzzy_match_score(token_node['chunk'], context_cluster.source_node['name'])
+                if fuzzy_score_source < self.model.match_threshold:
+                    print('... SOURCE NODE MATCH: ', token_node['chunk'], context_cluster.source_node['name'])
+                    context_score += (2 - fuzzy_score_source)
+
+                # CONTEXT
                 else:
-                    print(i, j)
-                    print(el_i, el_j)
-                    time1 = time.time()
-                    try:
-                        dist_ij = node_distance(g, el_i['uri'].replace('https://opencae.jpl.nasa.gov/mms/rdf/element/', ''), el_j['uri'].replace('https://opencae.jpl.nasa.gov/mms/rdf/element/', ''))
-                        print()
-                        print('SUCCESS in ', time.time()-time1, 's ', dist_ij)
-                    except:
-                        print('FAILURE in ', time.time()-time1, 's:  ')
-                        dist_ij = 11
-                    print('_________')
+                    for cluster_node in context_cluster.context:
 
-                # We use 1/dist_ij because the Paris algorithm uses higher_weight=greater_proximity convention
-                req_subgraph.add_edge(i, j, weight=dist_ij)
+                        # Nothing restricts neighbor_node to have a name but the way the graph was generated, so we may want to catch eceptions
+                        try:
+                            fuzzy_score = fuzzy_match_score(token_node['chunk'],  cluster_node['name'])
+                        except:
+                            print('Unexpected Behavior: neighbor_node has no name attribute: ', cluster_node)
+                            break
 
-        self.req_subgraph = req_subgraph
-        return req_subgraph
+                        # If we find a match, increment score and break out of {for cluster_node} loop
+                        if fuzzy_score < self.model.match_threshold:
+                            print('... CONTEXT MATCH: ', token_node['chunk'],  cluster_node['name'], context_cluster.source_node)
+                            context_score += (1 - fuzzy_score)
+                            break
+        return context_score
 
 
 
-    def match_clustering(self):
-        '''Uses the NetworkX req_subgraph and Scipy's linkage matrix to order the subgraph by
-        hierarchical clustering order, and returns the correct matches'''
+    def context_cluster_mapping(self):
+        '''Loops through all ContextClusters of the model and returns the ContextCluster that has the highest score
+        Its source_node will be the target of the Allocation'''
+        max_score = 0
+        allocation_target = None
 
-        k = 1
-        max_k = self.req_subgraph.number_of_nodes()
-        winners=dict()
-
-        cluster = order_clustering(self.req_subgraph, max_k)
-
-        for el_i in cluster:
-            token_i_id = self.req_subgraph.nodes(data=True)[el_i]['token']['token_id']
-            if token_i_id not in winners:
-                winners[token_i_id]=self.req_subgraph.nodes(data=True)[el_i]
-        
-        return winners
-
-
-
-##### LEGACY 
-
-    def match_clustering_stop_condition(self):
-        '''Uses the NetworkX req_subgraph to cluster the couple together, until the condition "No one token should be in a 
-        single cluster more than once" is not verified'''
-
-        linkage_array = scipy.cluster.hierarchy.linkage(ssd.squareform(nx.to_numpy_matrix(self.req_subgraph)))
-        looper = True
-        k = 1
-        max_k = self.req_subgraph.number_of_nodes()
-
-        print(linkage_array)
-
-        while looper and k < max_k:
-
-            cluster_list = select_clustering(linkage_array, k)
-            looper = self.check_continue(select_clustering(linkage_array, k+1))
-            k += 1
-
-        print(cluster_list)
-        
-        winners = dict()
-        for cluster in cluster_list:
-            for el_i in cluster:
-                token_i_id = self.req_subgraph.nodes(data=True)[el_i]['token']['token_id']
-                if token_i_id not in winners:
-                    winners[token_i_id]=self.req_subgraph.nodes(data=True)[el_i]['model_element']['uri']
-                    
-        return winners
-
-
-
-    def check_continue(self, L):
-        '''Takes in a list returned by select_clustering and checks that no cluster has 2 times the same token in it'''
-        
-        # For each cluster
-        for cluster in L:
-
-            # checks that no 2 nodes in the cluster has the same source token
-            for i in range(len(cluster)):
-                token_i = self.req_subgraph.nodes(data=True)[cluster[i]]['token']
-                for j in range(i+1, len(cluster)):
-
-                    token_j = self.req_subgraph.nodes(data=True)[cluster[j]]['token']
-
-                    if token_i['token_id']==token_j['token_id']:
-                        return False
-
-        return True
-
-
-
-# Clusters all the way and returns an ordonated list
-def order_clustering(G, k):
-    D = scipy.cluster.hierarchy.linkage(ssd.squareform(nx.to_numpy_matrix(G)))
-    n = np.shape(D)[0] + 1
-    k = min(k,n - 1)
-    cluster = {i:[0, i] for i in range(n)}
-    for t in range(k):
-        C1, C2 = cluster.pop(int(D[t][0])), cluster.pop(int(D[t][1]))
-        if len(C1) > len(C2):
-            cluster[n + t] = [t+1] + C1[1:] + C2[1:]
-        elif len(C1) < len(C2):
-            cluster[n + t] = [t+1] + C2[1:] + C1[1:]
-        else:
-            if C1[0] < C2[0]:
-                cluster[n + t] = [t+1] + C1[1:] + C2[1:]
-            elif C1[0] > C2[0]:
-                cluster[n + t] = [t+1] + C2[1:] + C1[1:]
-            else:
-                if C1[0]!=0 or C2[0]!=0:
-                    print('WARNING: Same age but not equal to 0')
-                elif G.nodes(data=True)[C1[1]]['token']['token_id'] == G.nodes(data=True)[C2[1]]['token']['token_id']:
-                    print('WARNING: Same age (0) and same token were merged\nToken:', G.nodes(data=True)[C1[1]]['token'])
-                    cluster[n + t] = [t+1] + C1[1:] + C2[1:]
-                else:
-                    cluster[n + t] = [t+1] + C1[1:] + C2[1:]
-
-    return cluster[n+t][1:]
+        for context in self.model.contexts:
+            current_score = self.context_cluster_scoring(context)
+            if current_score > max_score:
+                max_score = current_score
+                allocation_target = context
+        return allocation_target
